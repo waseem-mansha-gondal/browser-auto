@@ -1,0 +1,315 @@
+/**
+ * visa-checker.js
+ *
+ * Requirements:
+ *   npm i playwright
+ *
+ * Run:
+ *   node visa-checker.js
+ *
+ * Env (recommended):
+ *   export VISA_USERNAME="ahmed.21990"
+ *   export VISA_PASSWORD="@ahmed1990"
+ *   export VISA_CITY="Mandi"
+ *   export VISA_HERO="ali"
+ *   export VISA_FOOD="mango"
+ *   export HEADLESS="0"   # 0 to see browser, 1 headless
+ *
+ * Notes:
+ * - This script intentionally does NOT solve CAPTCHAs. It pauses and asks you to handle it.
+ * - The portal sometimes loops back to login (ExternalAuthenticationFailed). Script retries.
+ */
+
+const { chromium } = require("playwright");
+const fs = require("fs");
+const path = require("path");
+
+const ATLAS_LOGIN_URL =
+  "https://atlasauth.b2clogin.com/f50ebcfb-eadd-41d8-9099-a7049d073f5c/b2c_1a_atoproduction_atlas_susi/oauth2/v2.0/authorize?client_id=607d08d6-b63b-4735-ad82-05dfcff7efa4&redirect_uri=https%3A%2F%2Fwww.usvisascheduling.com%2Fsignin-aad-b2c_1&response_type=code%20id_token&scope=openid&response_mode=form_post&ui_locales=en-US&x-client-SKU=ID_NET472&x-client-ver=6.35.0.0";
+
+const USERNAME = process.env.VISA_USERNAME || "ahmed.21990";
+const PASSWORD = process.env.VISA_PASSWORD || "@ahmed1990";
+const CITY = process.env.VISA_CITY || "Mandi";
+const HERO = process.env.VISA_HERO || "ali";
+const FOOD = process.env.VISA_FOOD || "mango";
+
+const HEADLESS = (process.env.HEADLESS || "0") === "1";
+const STORAGE_STATE = path.join(__dirname, "storage-state.json");
+
+function log(...args) {
+  console.log(new Date().toISOString(), "-", ...args);
+}
+
+async function maybeLoadStorageState() {
+  if (fs.existsSync(STORAGE_STATE)) return STORAGE_STATE;
+  return undefined;
+}
+
+async function saveStorageState(context) {
+  await context.storageState({ path: STORAGE_STATE });
+  log("Saved storage state:", STORAGE_STATE);
+}
+
+async function waitForManualCaptchaOrYourSolver(page) {
+  // Hook point: you can implement your own solver here.
+  // For example: detect captcha image/audio, run your solver, fill Captcha Text, then click Sign In.
+
+  // We just pause if captcha field exists.
+  const captchaField = page.getByLabel("Captcha Text*");
+  if (await captchaField.count()) {
+    log("CAPTCHA detected. Please solve it (manually or your solver), then press Enter in the terminal...");
+    // Bring page to front (useful when headless=false)
+    await page.bringToFront();
+
+    // Wait until user confirms in terminal OR captcha field becomes non-empty.
+    await Promise.race([
+      new Promise((resolve) => {
+        process.stdin.resume();
+        process.stdin.once("data", () => resolve());
+      }),
+      (async () => {
+        for (let i = 0; i < 600; i++) { // up to ~10 min
+          const val = await captchaField.inputValue().catch(() => "");
+          if (val && val.trim().length > 0) return;
+          await page.waitForTimeout(1000);
+        }
+      })(),
+    ]);
+  }
+}
+
+async function fillLoginIfPresent(page) {
+  // Atlas login page uses labels "Username*" and "Password*"
+  const username = page.getByLabel("Username*");
+  const password = page.getByLabel("Password*");
+
+  if (await username.count()) {
+    log("Login form present: filling username/password");
+    await username.fill(USERNAME, { timeout: 10_000 });
+    await password.fill(PASSWORD, { timeout: 10_000 });
+
+    await waitForManualCaptchaOrYourSolver(page);
+
+    // Try clicking Sign In
+    const signIn = page.getByRole("button", { name: "Sign In" });
+    if (await signIn.count()) {
+      await Promise.all([
+        page.waitForLoadState("networkidle").catch(() => {}),
+        signIn.click(),
+      ]);
+    }
+  }
+}
+
+async function answerSecurityQuestionsIfPresent(page) {
+  // We saw prompts like:
+  // "What is the name of the town/city where you were born?"
+  // "Who was your childhood hero?"
+  // Sometimes also "What is your favorite food?"
+
+  // Strategy: look for these question texts and fill the next textbox.
+  const q1 = page.getByText(/town\/city where you were born/i);
+  const q2 = page.getByText(/childhood hero/i);
+  const q3 = page.getByText(/favorite food/i);
+
+  // Textboxes on that page have no label; we can use locator strategy:
+  // find the paragraph with question and then locate following textbox in same listitem.
+  async function fillAfterQuestion(questionLocator, answer) {
+    if (!(await questionLocator.count())) return false;
+    const container = questionLocator.first().locator("xpath=ancestor::li[1]");
+    const input = container.locator("input[type='text'], input:not([type])").first();
+    await input.fill(answer);
+    return true;
+  }
+
+  const did1 = await fillAfterQuestion(q1, CITY);
+  const did2 = await fillAfterQuestion(q2, HERO);
+  const did3 = await fillAfterQuestion(q3, FOOD);
+
+  if (did1 || did2 || did3) {
+    log("Security questions detected. Filled:", { did1, did2, did3 });
+    const cont = page.getByRole("button", { name: /continue/i });
+    if (await cont.count()) {
+      await Promise.all([
+        page.waitForLoadState("networkidle").catch(() => {}),
+        cont.click(),
+      ]);
+    }
+  }
+}
+
+async function ensureLoggedIn(page) {
+  // Try a few cycles because sometimes auth fails and returns to login.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    log(`Auth attempt ${attempt}/3: navigating to Atlas login URL`);
+    await page.goto(ATLAS_LOGIN_URL, { waitUntil: "domcontentloaded" });
+
+    await fillLoginIfPresent(page);
+    await answerSecurityQuestionsIfPresent(page);
+
+    // After successful sign-in, we should land on usvisascheduling
+    // Some states show a simple page with a "Sign in" link on usvisascheduling.
+    const usVisaSignInLink = page.getByRole("link", { name: /^Sign in$/i });
+    if (await usVisaSignInLink.count()) {
+      log("On usvisascheduling landing page with 'Sign in' link. Clicking it.");
+      await Promise.all([
+        page.waitForLoadState("networkidle").catch(() => {}),
+        usVisaSignInLink.click(),
+      ]);
+      await fillLoginIfPresent(page);
+      await answerSecurityQuestionsIfPresent(page);
+    }
+
+    // Check if we're on dashboard (menu shows user name; presence of nav links)
+    const rescheduleLink = page.getByRole("link", { name: /Reschedule Appointment/i });
+    const manageApps = page.getByRole("link", { name: /Manage Applications/i });
+
+    if ((await rescheduleLink.count()) || (await manageApps.count())) {
+      log("Looks logged in (dashboard nav detected).");
+      return true;
+    }
+
+    // If we got bounced back to login, try again.
+    log("Not clearly logged in yet; retrying...");
+  }
+  return false;
+}
+
+async function gotoReschedule(page) {
+  const reschedule = page.getByRole("link", { name: /Reschedule Appointment/i });
+  if (!(await reschedule.count())) {
+    // Sometimes dashboard is not showing; go home and re-check
+    await page.goto("https://www.usvisascheduling.com/en-US/", { waitUntil: "domcontentloaded" });
+  }
+  await page.getByRole("link", { name: /Reschedule Appointment/i }).click();
+  await page.waitForLoadState("networkidle").catch(() => {});
+  log("Opened reschedule page:", page.url());
+}
+
+async function selectConsularPost(page, postName = "ISLAMABAD") {
+  const combo = page.getByRole("combobox", { name: /Consular Posts/i });
+  await combo.selectOption({ label: postName });
+  await page.waitForTimeout(600);
+  log("Selected Consular Post:", postName);
+}
+
+async function findEnabledDatesOnCurrentLeftMonth(page) {
+  // jQuery UI datepicker: enabled dates have td without 'ui-datepicker-unselectable' / 'ui-state-disabled'
+  return await page.evaluate(() => {
+    const dp = document.querySelector(".ui-datepicker");
+    if (!dp) return { error: "no datepicker" };
+    const g = dp.querySelector(".ui-datepicker-group-first") || dp;
+
+    const monthSel = g.querySelector("select.ui-datepicker-month");
+    const yearSel = g.querySelector("select.ui-datepicker-year");
+    const month = monthSel?.options[monthSel.selectedIndex]?.text;
+    const year = yearSel?.options[yearSel.selectedIndex]?.text;
+
+    const enabled = [...g.querySelectorAll("td:not(.ui-datepicker-unselectable):not(.ui-state-disabled) a.ui-state-default")]
+      .map(a => a.textContent.trim());
+
+    return { month, year, enabled };
+  });
+}
+
+async function clickNextMonth(page) {
+  // There is usually a next button in datepicker
+  await page.evaluate(() => {
+    const dp = document.querySelector(".ui-datepicker");
+    const next = dp?.querySelector(".ui-datepicker-next");
+    next?.click();
+  });
+  await page.waitForTimeout(300);
+}
+
+async function scanForAvailability(page, maxNextClicks = 36) {
+  for (let i = 0; i < maxNextClicks; i++) {
+    const info = await findEnabledDatesOnCurrentLeftMonth(page);
+    if (info.error) throw new Error(info.error);
+
+    log(`Month check: ${info.month} ${info.year} - enabledCount=${info.enabled.length}`);
+
+    if (info.enabled.length > 0) {
+      return info; // {month, year, enabled:[...days]}
+    }
+    await clickNextMonth(page);
+  }
+  return null;
+}
+
+async function main() {
+  const browser = await chromium.launch({ headless: HEADLESS });
+  const context = await browser.newContext({
+    storageState: await maybeLoadStorageState(),
+    viewport: { width: 1280, height: 800 },
+  });
+  const page = await context.newPage();
+
+  try {
+    const ok = await ensureLoggedIn(page);
+    if (!ok) throw new Error("Unable to login after retries (likely CAPTCHA or auth failure).");
+
+    await saveStorageState(context);
+
+    await gotoReschedule(page);
+    await selectConsularPost(page, "ISLAMABAD");
+
+    const found = await scanForAvailability(page, 48);
+    if (!found) {
+      log("No availability found in scan window.");
+      process.exitCode = 2;
+      return;
+    }
+
+    log("FOUND availability:", found);
+
+    // OPTIONAL: click earliest enabled day in that month (first in list)
+    // Uncomment if you want it to select a date (still NOT submitting):
+    //
+    // const dayToClick = found.enabled[0];
+    // log("Clicking day:", dayToClick);
+    // await page.getByRole("link", { name: new RegExp(`^${dayToClick}$`) }).first().click();
+    // await page.waitForTimeout(800);
+
+  } finally {
+    // Keep browser open if headless=false so you can inspect
+    if (HEADLESS) await browser.close();
+    else log("Headless disabled; leaving browser open. Close it manually when done.");
+  }
+}
+
+main().catch((e) => {
+  console.error("ERROR:", e);
+  process.exitCode = 1;
+});
+2) Install + Run
+mkdir -p visa-bot && cd visa-bot
+npm init -y
+npm i playwright
+# playwright install might be needed depending on your system:
+npx playwright install
+
+# Save the script as visa-checker.js
+node visa-checker.js
+3) Run every hour (cron)
+Example cron (runs at minute 5 every hour):
+
+5 * * * * /usr/local/bin/node /path/to/visa-bot/visa-checker.js >> /path/to/visa-bot/run.log 2>&1
+If you want it to notify you, we can add:
+
+Telegram/WhatsApp/Signal message send (depending on what you have connected),
+or just write a FOUND.json + screenshot.
+4) Where you plug in your CAPTCHA solver
+In waitForManualCaptchaOrYourSolver(page) you can:
+
+detect captcha/audio UI
+run your solver
+fill the “Captcha Text*” field
+then the script continues and clicks “Sign In”
+That’s the clean hook point.
+
+If you tell me your preferred “notify method” (write file vs send message), I can extend the script to output:
+
+screenshot on found availability
+JSON with { post, month, year, days, timestamp, url }
+optional: also scrape time slots after clicking a date (without submitting).
